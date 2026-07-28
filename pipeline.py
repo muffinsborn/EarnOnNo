@@ -16,6 +16,11 @@ Usage:
     python pipeline.py --max-markets 20         # small test run
     python pipeline.py --resolved-only          # skip open markets
     python pipeline.py --open-only              # skip resolved markets
+    python pipeline.py --resync-events          # force a full /events re-pull (normally skipped once populated)
+
+Safe to interrupt and re-run: every write is an idempotent upsert, and the
+one-time bulk /events pull (the slowest phase) is skipped automatically once
+events already exist locally, so a restart goes straight to markets/candles.
 """
 import argparse
 import logging
@@ -59,6 +64,13 @@ def sync_events(client: KalshiClient, conn) -> dict:
         db.upsert_events(conn, batch, _now_iso())
     logger.info("Stored %d events.", count)
     return event_to_series
+
+
+def load_event_to_series(conn) -> dict:
+    return {
+        row[0]: row[1]
+        for row in conn.execute("select event_ticker, series_ticker from events").fetchall()
+    }
 
 
 def backfill_missing_events(client: KalshiClient, conn, markets: list[dict], event_to_series: dict) -> None:
@@ -122,8 +134,22 @@ def sync_candles(
     total = len(markets)
     logger.info("Fetching %d-minute candlesticks for %d markets...", period_interval, total)
     now_ts = now_unix_ts()
+
+    # A finalized market's price history never changes, so if we already have
+    # candles for it (e.g. from a run interrupted partway through), skip it -
+    # this is what makes restarts cheap instead of re-pulling everything.
+    already_done = {
+        row[0] for row in conn.execute(
+            "select distinct ticker from market_candles where period_interval = ?", (period_interval,)
+        ).fetchall()
+    }
+    skipped = 0
+
     for i, market in enumerate(markets, start=1):
         ticker = market["ticker"]
+        if ticker in already_done and market.get("status") == "finalized":
+            skipped += 1
+            continue
         series_ticker = event_to_series.get(market.get("event_ticker"))
         if not series_ticker:
             logger.warning("Skipping candles for %s: no series_ticker found via event_ticker=%s",
@@ -149,7 +175,9 @@ def sync_candles(
             db.upsert_candles(conn, ticker, period_interval, candles)
 
         if i % 100 == 0 or i == total:
-            logger.info("...candles pulled for %d/%d markets", i, total)
+            logger.info("...candles pulled for %d/%d markets (%d already done, skipped)", i, total, skipped)
+
+    logger.info("Candles done: %d fetched, %d already had data and were skipped.", total - skipped, skipped)
 
 
 def main():
@@ -162,6 +190,10 @@ def main():
                          help="Cap number of resolved/open markets pulled - use for a quick test run")
     parser.add_argument("--resolved-only", action="store_true", help="Only pull resolved (settled) markets")
     parser.add_argument("--open-only", action="store_true", help="Only pull currently open markets")
+    parser.add_argument("--resync-events", action="store_true",
+                         help="Force a full re-pull of the bulk /events listing even if we already have events "
+                              "stored (by default, once events exist locally we skip this ~5-6 min bulk pull and "
+                              "rely on per-market backfill for anything missing - much more resilient to restarts)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -181,7 +213,17 @@ def main():
 
     start = time.monotonic()
     sync_series(client, conn)
-    event_to_series = sync_events(client, conn)
+
+    existing_event_count = conn.execute("select count(*) from events").fetchone()[0]
+    if args.resync_events or existing_event_count == 0:
+        event_to_series = sync_events(client, conn)
+    else:
+        logger.info(
+            "Skipping bulk /events resync - %d events already stored locally "
+            "(pass --resync-events to force a full refresh).",
+            existing_event_count,
+        )
+        event_to_series = load_event_to_series(conn)
 
     all_markets = []
     if not args.open_only:
