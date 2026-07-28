@@ -1,0 +1,172 @@
+"""Kalshi data pipeline - Phase 1: read-only historical + current market data.
+
+Populates a local SQLite database (see kalshi_pipeline/db.py for schema docs)
+with:
+  - series metadata (category, title)
+  - event metadata (links markets -> series)
+  - resolved (settled) markets, with final result
+  - currently open markets
+  - price candlesticks for each market, at --candle-interval minutes
+
+No order placement or trading logic lives here - every API call is a GET.
+
+Usage:
+    python pipeline.py                          # full run, everything available
+    python pipeline.py --skip-candles           # metadata only, fast, good first check
+    python pipeline.py --max-markets 20         # small test run
+    python pipeline.py --resolved-only          # skip open markets
+    python pipeline.py --open-only              # skip resolved markets
+"""
+import argparse
+import logging
+import time
+from datetime import datetime, timezone
+
+from kalshi_pipeline import db
+from kalshi_pipeline.client import KalshiAPIError, KalshiClient
+from kalshi_pipeline.config import ConfigError, load_config
+from kalshi_pipeline.timeutil import now_unix_ts, to_unix_ts
+
+logger = logging.getLogger("kalshi_pipeline")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sync_series(client: KalshiClient, conn) -> None:
+    logger.info("Fetching series list...")
+    series = client.get_series_list()
+    db.upsert_series(conn, series, _now_iso())
+    logger.info("Stored %d series.", len(series))
+
+
+def sync_events(client: KalshiClient, conn) -> dict:
+    """Returns event_ticker -> series_ticker map, needed later for candlesticks."""
+    logger.info("Fetching events (for series linkage)...")
+    event_to_series = {}
+    batch = []
+    count = 0
+    for event in client.iter_events():
+        event_to_series[event["event_ticker"]] = event.get("series_ticker")
+        batch.append(event)
+        count += 1
+        if len(batch) >= 500:
+            db.upsert_events(conn, batch, _now_iso())
+            batch = []
+            logger.info("...%d events fetched so far", count)
+    if batch:
+        db.upsert_events(conn, batch, _now_iso())
+    logger.info("Stored %d events.", count)
+    return event_to_series
+
+
+def sync_markets(client: KalshiClient, conn, status: str, label: str, max_markets: int | None) -> list[dict]:
+    logger.info("Fetching %s markets (status=%s)...", label, status)
+    fetched = []
+    batch = []
+    count = 0
+    for market in client.iter_markets(status=status):
+        batch.append(market)
+        fetched.append(market)
+        count += 1
+        if len(batch) >= 500:
+            db.upsert_markets(conn, batch, _now_iso())
+            batch = []
+            logger.info("...pulled %d %s markets so far", count, label)
+        if max_markets and count >= max_markets:
+            break
+    if batch:
+        db.upsert_markets(conn, batch, _now_iso())
+    logger.info("Stored %d %s markets.", count, label)
+    return fetched
+
+
+def sync_candles(
+    client: KalshiClient,
+    conn,
+    markets: list[dict],
+    event_to_series: dict,
+    period_interval: int,
+) -> None:
+    total = len(markets)
+    logger.info("Fetching %d-minute candlesticks for %d markets...", period_interval, total)
+    now_ts = now_unix_ts()
+    for i, market in enumerate(markets, start=1):
+        ticker = market["ticker"]
+        series_ticker = event_to_series.get(market.get("event_ticker"))
+        if not series_ticker:
+            logger.warning("Skipping candles for %s: no series_ticker found via event_ticker=%s",
+                            ticker, market.get("event_ticker"))
+            continue
+
+        start_ts = to_unix_ts(market.get("open_time"))
+        end_ts = to_unix_ts(market.get("close_time")) or now_ts
+        if start_ts is None:
+            logger.warning("Skipping candles for %s: no open_time", ticker)
+            continue
+        end_ts = min(end_ts, now_ts)
+        if end_ts <= start_ts:
+            continue
+
+        try:
+            candles = list(client.iter_candlesticks(series_ticker, ticker, start_ts, end_ts, period_interval))
+        except KalshiAPIError as exc:
+            logger.error("Failed to fetch candles for %s: %s", ticker, exc)
+            continue
+
+        if candles:
+            db.upsert_candles(conn, ticker, period_interval, candles)
+
+        if i % 100 == 0 or i == total:
+            logger.info("...candles pulled for %d/%d markets", i, total)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Kalshi data pipeline (Phase 1: read-only)")
+    parser.add_argument("--db", help="Override KALSHI_DB_PATH from .env")
+    parser.add_argument("--skip-candles", action="store_true", help="Skip candlestick time-series pull (fast, metadata only)")
+    parser.add_argument("--candle-interval", type=int, default=60, choices=[1, 60, 1440],
+                         help="Candlestick period in minutes (default 60 = hourly)")
+    parser.add_argument("--max-markets", type=int, default=None,
+                         help="Cap number of resolved/open markets pulled - use for a quick test run")
+    parser.add_argument("--resolved-only", action="store_true", help="Only pull resolved (settled) markets")
+    parser.add_argument("--open-only", action="store_true", help="Only pull currently open markets")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        logger.error(str(exc))
+        raise SystemExit(1)
+
+    db_path = args.db or config.db_path
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    logger.info("Using database: %s", db_path)
+
+    client = KalshiClient(config)
+
+    start = time.monotonic()
+    sync_series(client, conn)
+    event_to_series = sync_events(client, conn)
+
+    all_markets = []
+    if not args.open_only:
+        all_markets += sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets)
+    if not args.resolved_only:
+        all_markets += sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
+
+    if not args.skip_candles:
+        sync_candles(client, conn, all_markets, event_to_series, args.candle_interval)
+    else:
+        logger.info("Skipping candlestick pull (--skip-candles).")
+
+    conn.close()
+    logger.info("Done in %.1fs.", time.monotonic() - start)
+
+
+if __name__ == "__main__":
+    main()
