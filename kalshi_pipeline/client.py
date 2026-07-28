@@ -42,7 +42,7 @@ class KalshiClient:
             time.sleep(self.min_interval - elapsed)
         self._last_request_at = time.monotonic()
 
-    def _get(self, path: str, params: dict | None = None, max_retries: int = 6) -> dict:
+    def _get(self, path: str, params: dict | None = None, max_retries: int = 10) -> dict:
         url = self.base_url + path
         sign_path = self.base_path + path
         attempt = 0
