@@ -103,10 +103,12 @@ class KalshiClient:
         data = self._get(f"/events/{event_ticker}")
         return data.get("event")
 
-    def iter_markets(self, status: str, limit: int = 1000):
+    def iter_markets(self, status: str, limit: int = 1000, mve_filter: str | None = "exclude"):
         cursor = None
         while True:
             params = {"limit": limit, "status": status}
+            if mve_filter:
+                params["mve_filter"] = mve_filter
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/markets", params=params)
