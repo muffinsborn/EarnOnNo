@@ -61,6 +61,36 @@ def sync_events(client: KalshiClient, conn) -> dict:
     return event_to_series
 
 
+def backfill_missing_events(client: KalshiClient, conn, markets: list[dict], event_to_series: dict) -> None:
+    """Some event types (e.g. multivariate-event combo markets) don't appear
+    in the bulk /events listing at all, even paginated to completion, but do
+    exist via the single-event endpoint. Fetch those individually so their
+    markets still resolve a category."""
+    missing = sorted({
+        m["event_ticker"] for m in markets
+        if m.get("event_ticker") and m["event_ticker"] not in event_to_series
+    })
+    if not missing:
+        return
+    logger.info("Backfilling %d events missing from the bulk /events listing...", len(missing))
+    fetched = []
+    for i, event_ticker in enumerate(missing, start=1):
+        try:
+            event = client.get_event(event_ticker)
+        except KalshiAPIError as exc:
+            logger.warning("Could not backfill event %s: %s", event_ticker, exc)
+            continue
+        if not event:
+            continue
+        event_to_series[event["event_ticker"]] = event.get("series_ticker")
+        fetched.append(event)
+        if i % 100 == 0 or i == len(missing):
+            logger.info("...backfilled %d/%d missing events", i, len(missing))
+    if fetched:
+        db.upsert_events(conn, fetched, _now_iso())
+    logger.info("Backfilled %d/%d missing events.", len(fetched), len(missing))
+
+
 def sync_markets(client: KalshiClient, conn, status: str, label: str, max_markets: int | None) -> list[dict]:
     logger.info("Fetching %s markets (status=%s)...", label, status)
     fetched = []
@@ -158,6 +188,8 @@ def main():
         all_markets += sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets)
     if not args.resolved_only:
         all_markets += sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
+
+    backfill_missing_events(client, conn, all_markets, event_to_series)
 
     if not args.skip_candles:
         sync_candles(client, conn, all_markets, event_to_series, args.candle_interval)

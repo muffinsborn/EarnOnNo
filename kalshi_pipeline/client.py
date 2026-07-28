@@ -96,6 +96,13 @@ class KalshiClient:
             if not cursor or not events:
                 break
 
+    def get_event(self, event_ticker: str) -> dict | None:
+        """Fetch a single event. Needed as a fallback for multivariate-event
+        (MVE) combo markets, whose parent events don't appear in the bulk
+        /events listing but do exist individually."""
+        data = self._get(f"/events/{event_ticker}")
+        return data.get("event")
+
     def iter_markets(self, status: str, limit: int = 1000):
         cursor = None
         while True:
