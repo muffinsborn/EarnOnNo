@@ -103,25 +103,44 @@ def backfill_missing_events(client: KalshiClient, conn, markets: list[dict], eve
     logger.info("Backfilled %d/%d missing events.", len(fetched), len(missing))
 
 
-def sync_markets(client: KalshiClient, conn, status: str, label: str, max_markets: int | None) -> list[dict]:
+def sync_markets(client: KalshiClient, conn, status: str, label: str, max_markets: int | None) -> None:
+    """Paginates /markets, checkpointing the cursor after every page so a
+    restart resumes instead of re-walking from page 1 (this listing alone
+    can be millions of rows - re-walking it on every restart in a session
+    that recycles every few minutes would never finish)."""
+    checkpoint_key = f"markets_cursor:{status}"
+    start_cursor = db.get_sync_cursor(conn, checkpoint_key)
+    if start_cursor:
+        logger.info("Resuming %s markets sync from a saved checkpoint...", label)
     logger.info("Fetching %s markets (status=%s)...", label, status)
-    fetched = []
-    batch = []
+
     count = 0
-    for market in client.iter_markets(status=status):
-        batch.append(market)
-        fetched.append(market)
-        count += 1
-        if len(batch) >= 500:
-            db.upsert_markets(conn, batch, _now_iso())
-            batch = []
-            logger.info("...pulled %d %s markets so far", count, label)
+    hit_cap = False
+    for markets, cursor in client.iter_market_pages(status=status, start_cursor=start_cursor):
+        if markets:
+            db.upsert_markets(conn, markets, _now_iso())
+            count += len(markets)
+        db.set_sync_cursor(conn, checkpoint_key, cursor)
+        logger.info("...pulled %d %s markets so far (checkpointed)", count, label)
         if max_markets and count >= max_markets:
+            hit_cap = True
             break
-    if batch:
-        db.upsert_markets(conn, batch, _now_iso())
-    logger.info("Stored %d %s markets.", count, label)
-    return fetched
+        if not cursor or not markets:
+            break
+
+    if not hit_cap:
+        db.clear_sync_cursor(conn, checkpoint_key)
+    logger.info("Stored %d %s markets this run.", count, label)
+
+
+def load_markets_for_candles(conn) -> list[dict]:
+    """Pulls the full market set straight from the DB (cumulative across every
+    run to date) rather than relying on any single run's in-memory list,
+    since a resumed sync_markets run only yields the pages it fetched THIS
+    time - markets stored by earlier, interrupted runs still need candles."""
+    cols = ["ticker", "event_ticker", "status", "open_time", "close_time"]
+    rows = conn.execute(f"select {', '.join(cols)} from markets").fetchall()
+    return [dict(zip(cols, row)) for row in rows]
 
 
 def sync_candles(
@@ -225,12 +244,12 @@ def main():
         )
         event_to_series = load_event_to_series(conn)
 
-    all_markets = []
     if not args.open_only:
-        all_markets += sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets)
+        sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets)
     if not args.resolved_only:
-        all_markets += sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
+        sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
 
+    all_markets = load_markets_for_candles(conn)
     backfill_missing_events(client, conn, all_markets, event_to_series)
 
     if not args.skip_candles:

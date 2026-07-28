@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS market_candles (
     PRIMARY KEY (ticker, period_interval, end_period_ts)
 );
 
+CREATE TABLE IF NOT EXISTS sync_state (
+    key    TEXT PRIMARY KEY,
+    cursor TEXT
+);
+
 CREATE VIEW IF NOT EXISTS market_overview AS
 SELECT
     m.ticker,
@@ -229,4 +234,23 @@ def upsert_candles(conn: sqlite3.Connection, ticker: str, period_interval: int, 
             for c in rows
         ],
     )
+    conn.commit()
+
+
+def get_sync_cursor(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("select cursor from sync_state where key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_sync_cursor(conn: sqlite3.Connection, key: str, cursor: str | None) -> None:
+    conn.execute(
+        "INSERT INTO sync_state (key, cursor) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET cursor=excluded.cursor",
+        (key, cursor),
+    )
+    conn.commit()
+
+
+def clear_sync_cursor(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("DELETE FROM sync_state WHERE key = ?", (key,))
     conn.commit()

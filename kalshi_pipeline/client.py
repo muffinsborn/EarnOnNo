@@ -103,8 +103,13 @@ class KalshiClient:
         data = self._get(f"/events/{event_ticker}")
         return data.get("event")
 
-    def iter_markets(self, status: str, limit: int = 1000, mve_filter: str | None = "exclude"):
-        cursor = None
+    def iter_market_pages(
+        self, status: str, limit: int = 1000, mve_filter: str | None = "exclude", start_cursor: str | None = None
+    ):
+        """Yields (markets, cursor_after_this_page) per page, so callers can
+        checkpoint the cursor and resume a multi-hour pull after a restart
+        instead of re-walking from page 1 every time."""
+        cursor = start_cursor
         while True:
             params = {"limit": limit, "status": status}
             if mve_filter:
@@ -113,11 +118,15 @@ class KalshiClient:
                 params["cursor"] = cursor
             data = self._get("/markets", params=params)
             markets = data.get("markets", [])
-            for market in markets:
-                yield market
             cursor = data.get("cursor") or None
+            yield markets, cursor
             if not cursor or not markets:
                 break
+
+    def iter_markets(self, status: str, limit: int = 1000, mve_filter: str | None = "exclude"):
+        for markets, _cursor in self.iter_market_pages(status, limit=limit, mve_filter=mve_filter):
+            for market in markets:
+                yield market
 
     def iter_candlesticks(
         self, series_ticker: str, ticker: str, start_ts: int, end_ts: int, period_interval: int
