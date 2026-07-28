@@ -90,7 +90,10 @@ def connect(db_path: str) -> sqlite3.Connection:
     if parent:
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
+    # Not enforced: Kalshi's own API data isn't guaranteed referentially
+    # consistent (e.g. events can reference a series_ticker that's since
+    # been filtered out of /series), and we'd rather keep every row the API
+    # gives us than silently drop children of a missing parent.
     return conn
 
 
