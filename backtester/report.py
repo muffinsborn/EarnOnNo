@@ -1,5 +1,6 @@
 """Stats, breakdowns, drawdown analysis, and CSV/report output."""
 import csv
+import math
 import statistics
 from datetime import datetime, timezone
 
@@ -58,6 +59,46 @@ def summarize(trades: list[dict]) -> dict:
         "avg_entry_price_no": round(avg_entry_price_no, 4) if avg_entry_price_no is not None else None,
         "breakeven_win_rate": round(breakeven_win_rate, 4) if breakeven_win_rate is not None else None,
         "edge_bps": round(edge_bps, 1) if edge_bps is not None else None,
+    }
+
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score confidence interval for a binomial proportion (default
+    z=1.96 = 95%). Used instead of the naive normal-approximation interval
+    (phat +/- z*sqrt(phat(1-phat)/n)) because that one is unreliable
+    exactly where this data lives - proportions away from 0.5 and/or
+    moderate n - since it can produce bounds outside [0,1] and understates
+    width. No scipy dependency needed."""
+    if n == 0:
+        return (0.0, 0.0)
+    phat = successes / n
+    denom = 1 + z**2 / n
+    center = phat + z**2 / (2 * n)
+    half = z * math.sqrt(phat * (1 - phat) / n + z**2 / (4 * n**2))
+    return (max(0.0, (center - half) / denom), min(1.0, (center + half) / denom))
+
+
+def edge_confidence(trades: list[dict], z: float = 1.96) -> dict:
+    """Is the apparent edge in summarize() statistically credible, or could
+    it just be noise from a small sample? Builds a Wilson interval around
+    the observed win rate and checks whether breakeven_win_rate falls
+    outside it - if breakeven is still inside the interval, the sample
+    can't distinguish this result from a coin flip at that price."""
+    stats = summarize(trades)
+    if stats.get("total_trades", 0) == 0 or stats.get("breakeven_win_rate") is None:
+        return {
+            **stats, "win_rate_ci_low": None, "win_rate_ci_high": None,
+            "edge_bps_ci_low": None, "edge_bps_ci_high": None, "edge_significant": None,
+        }
+    ci_low, ci_high = wilson_ci(stats["wins"], stats["total_trades"], z=z)
+    breakeven = stats["breakeven_win_rate"]
+    return {
+        **stats,
+        "win_rate_ci_low": round(ci_low, 4),
+        "win_rate_ci_high": round(ci_high, 4),
+        "edge_bps_ci_low": round((ci_low - breakeven) * 10000, 1),
+        "edge_bps_ci_high": round((ci_high - breakeven) * 10000, 1),
+        "edge_significant": bool(breakeven < ci_low or breakeven > ci_high),
     }
 
 

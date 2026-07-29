@@ -35,12 +35,18 @@ def discover_candidates(
     price_max: float,
     days_to_expiry: int,
     entry_offset_hours,
+    categories: set[str] | None = None,
 ) -> list[dict]:
     """Walks every finalized, traded market and evaluates it at its own
     fixed entry point (close_time - entry_offset_hours(category)). Returns
     only markets that (a) existed that far before close, (b) have candle
     data reaching back that far, and (c) had a YES price within
-    [price_min, price_max] at that point in time."""
+    [price_min, price_max] at that point in time.
+
+    categories, if given, restricts to just those category names (matched
+    against the same "Uncategorized" fallback used everywhere else) -
+    filtered before the point-in-time candle lookup so excluded markets
+    don't cost a query."""
     rows = conn.execute(
         """
         SELECT m.ticker, m.event_ticker, m.open_time, m.close_time, m.result, s.category
@@ -72,6 +78,8 @@ def discover_candidates(
             continue
 
         cat = category or "Uncategorized"
+        if categories is not None and cat not in categories:
+            continue
         entry_offset_s = _offset_hours_for_category(entry_offset_hours, cat) * 3600
         entry_ts = close_ts - entry_offset_s
         if entry_ts < open_ts:

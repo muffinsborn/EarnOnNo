@@ -33,9 +33,9 @@ import sqlite3
 
 from backtester.engine import discover_candidates, simulate_portfolio
 from backtester.report import (
-    breakdown_by_category,
     breakdown_by_price_bucket,
     drawdown_analysis,
+    edge_confidence,
     print_summary,
     save_trades_csv,
     stop_loss_exit_count,
@@ -78,6 +78,9 @@ def main():
                          help="Exit a position early if its mark-to-market value ever falls this fraction "
                               "below its entry cost (default 0.25 = 25%%), freeing its capital for "
                               "redeployment. Pass 0 to disable and hold every position to resolution.")
+    parser.add_argument("--categories", default=None,
+                         help="Comma-separated category names to restrict candidate discovery to (e.g. "
+                              "'Mentions,Politics,Entertainment'). Omit to include every category.")
     parser.add_argument("--out-dir", default="backtest_results", help="Directory for the trades CSV")
     args = parser.parse_args()
 
@@ -91,6 +94,8 @@ def main():
     # and this timeout is a defense-in-depth backstop against brief locks.
     conn = sqlite3.connect(args.db, timeout=30)
 
+    categories = {c.strip() for c in args.categories.split(",") if c.strip()} if args.categories else None
+
     entry_offset_hours = {"Sports": args.entry_offset_hours_sports, "_default": args.entry_offset_hours_other}
     candidates = discover_candidates(
         conn,
@@ -98,6 +103,7 @@ def main():
         price_max=args.price_max,
         days_to_expiry=args.days_to_expiry,
         entry_offset_hours=entry_offset_hours,
+        categories=categories,
     )
 
     trades = simulate_portfolio(
@@ -118,6 +124,19 @@ def main():
     overall = summarize(trades)
     print_summary("OVERALL", overall)
 
+    conf = edge_confidence(trades)
+    if conf.get("total_trades", 0) > 0 and conf["win_rate_ci_low"] is not None:
+        z_label = "95%"
+        print(f"\n=== EDGE CONFIDENCE ({z_label} Wilson interval) ===")
+        print(f"  win rate:            {conf['win_rate']*100:.2f}%  "
+              f"[{conf['win_rate_ci_low']*100:.2f}%, {conf['win_rate_ci_high']*100:.2f}%]")
+        print(f"  breakeven win rate:  {conf['breakeven_win_rate']*100:.2f}%")
+        print(f"  edge_bps:            {conf['edge_bps']}  "
+              f"(interval: [{conf['edge_bps_ci_low']}, {conf['edge_bps_ci_high']}])")
+        verdict = "YES - breakeven falls outside the CI" if conf["edge_significant"] \
+            else "NO - breakeven falls inside the CI, indistinguishable from noise at this sample size"
+        print(f"  statistically credible edge: {verdict}")
+
     dd = drawdown_analysis(trades, bankroll=args.bankroll)
     print(f"\n=== DRAWDOWN (worst stretch) ===")
     print(f"  max drawdown:  ${dd['max_drawdown_dollars']:,.2f} ({dd.get('max_drawdown_pct_of_bankroll')}% of starting bankroll)")
@@ -136,8 +155,16 @@ def main():
         print(f"  stop-loss: disabled (--stop-loss-pct 0)")
 
     print("\n=== BY CATEGORY ===")
-    for cat, stats in breakdown_by_category(trades).items():
-        print_summary(cat, stats)
+    by_cat: dict[str, list[dict]] = {}
+    for t in trades:
+        by_cat.setdefault(t["category"], []).append(t)
+    for cat, cat_trades in sorted(by_cat.items(), key=lambda kv: -len(kv[1])):
+        cat_conf = edge_confidence(cat_trades)
+        print_summary(cat, cat_conf)
+        if cat_conf.get("win_rate_ci_low") is not None:
+            verdict = "significant" if cat_conf["edge_significant"] else "not significant (noise-consistent)"
+            print(f"  win rate 95% CI: [{cat_conf['win_rate_ci_low']*100:.2f}%, {cat_conf['win_rate_ci_high']*100:.2f}%]"
+                  f"  vs breakeven {cat_conf['breakeven_win_rate']*100:.2f}%  -> {verdict}")
 
     print("\n=== BY PRICE BUCKET (YES price at entry) ===")
     for bucket, stats in breakdown_by_price_bucket(trades).items():
