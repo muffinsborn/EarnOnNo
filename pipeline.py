@@ -172,14 +172,21 @@ def load_markets_for_candles(conn, since_ts: int | None = None) -> list[dict]:
     qualify - they're current by definition). Metadata for older markets is
     untouched; this only scopes which markets get the (much more expensive)
     price time series pulled."""
-    cols = ["ticker", "event_ticker", "status", "open_time", "close_time"]
-    query = f"select {', '.join(cols)} from markets where volume is not null and volume > 0"
+    cols = ["m.ticker", "m.event_ticker", "m.status", "m.open_time", "m.close_time", "s.category"]
+    query = f"""
+        select {', '.join(cols)}
+        from markets m
+        left join events e on e.event_ticker = m.event_ticker
+        left join series s on s.ticker = e.series_ticker
+        where m.volume is not null and m.volume > 0
+    """
     params: list = []
     if since_ts is not None:
-        query += " and (status = 'active' or CAST(strftime('%s', close_time) AS INTEGER) >= ?)"
+        query += " and (m.status = 'active' or CAST(strftime('%s', m.close_time) AS INTEGER) >= ?)"
         params.append(since_ts)
     rows = conn.execute(query, params).fetchall()
-    return [dict(zip(cols, row)) for row in rows]
+    result_cols = ["ticker", "event_ticker", "status", "open_time", "close_time", "category"]
+    return [dict(zip(result_cols, row)) for row in rows]
 
 
 MAX_TICKERS_PER_BATCH = 100
@@ -330,6 +337,12 @@ def main():
                               "every market regardless - this only scopes the price time series. Kalshi's settled "
                               "market history via this listing only spans ~90 days back in practice, so anything "
                               "90+ is equivalent to unlimited. Use 0 for no limit.")
+    parser.add_argument("--priority-categories", default="Politics,Economics,Elections",
+                         help="Comma-separated category names to fetch candles for FIRST, before everything else "
+                              "(default: Politics,Economics,Elections - these are a small slice of the market "
+                              "universe by count, dominated by Sports/Crypto, so without this they'd only get "
+                              "covered incidentally whenever the batching order happens to reach them). Pass an "
+                              "empty string to disable prioritization and process in natural order.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -374,7 +387,21 @@ def main():
     backfill_missing_events(client, conn, all_markets, event_to_series)
 
     if not args.skip_candles:
-        sync_candles(client, conn, all_markets, args.candle_interval)
+        priority_cats = {c.strip() for c in args.priority_categories.split(",") if c.strip()}
+        if priority_cats:
+            priority_markets = [m for m in all_markets if m.get("category") in priority_cats]
+            other_markets = [m for m in all_markets if m.get("category") not in priority_cats]
+            # Two separate passes, not one sorted-together list: sync_candles
+            # internally re-sorts by start_ts for batching efficiency, which
+            # would erase any category-based priority if we just concatenated
+            # the lists first. Running priority markets to completion first
+            # is what actually guarantees they're attempted before the rest.
+            logger.info("Prioritizing %d markets in %s before the remaining %d.",
+                        len(priority_markets), sorted(priority_cats), len(other_markets))
+            sync_candles(client, conn, priority_markets, args.candle_interval)
+            sync_candles(client, conn, other_markets, args.candle_interval)
+        else:
+            sync_candles(client, conn, all_markets, args.candle_interval)
     else:
         logger.info("Skipping candlestick pull (--skip-candles).")
 
