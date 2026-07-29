@@ -38,9 +38,17 @@ def summarize(trades: list[dict]) -> dict:
     }
 
 
+def _exit_ts(t: dict) -> int:
+    """A trade's realization time - exit_ts if it was actually stopped out
+    or resolved by the engine, falling back to close_ts for any trade
+    produced by older code that predates the exit_ts field."""
+    return t.get("exit_ts", t["close_ts"])
+
+
 def drawdown_analysis(trades: list[dict], bankroll: float) -> dict:
-    """Builds a realized equity curve ordered by close time (P&L realizes at
-    resolution, not entry) and finds the single worst peak-to-trough
+    """Builds a realized equity curve ordered by exit time (P&L realizes
+    when a position actually leaves the portfolio - at a stop-loss or at
+    resolution, not at entry) and finds the single worst peak-to-trough
     stretch - the stress view, not just an average.
 
     Drawdown % is expressed against starting bankroll, not against the
@@ -52,11 +60,11 @@ def drawdown_analysis(trades: list[dict], bankroll: float) -> dict:
     if not trades:
         return {"max_drawdown_dollars": 0.0, "max_drawdown_pct_of_bankroll": 0.0, "worst_stretch_trades": []}
 
-    ordered = sorted(trades, key=lambda t: t["close_ts"])
+    ordered = sorted(trades, key=_exit_ts)
 
     equity = 0.0
     peak = 0.0
-    peak_ts = ordered[0]["close_ts"]
+    peak_ts = _exit_ts(ordered[0])
     max_dd = 0.0
     dd_peak_ts, dd_trough_ts = peak_ts, peak_ts
 
@@ -64,18 +72,18 @@ def drawdown_analysis(trades: list[dict], bankroll: float) -> dict:
         equity += t["pnl"]
         if equity > peak:
             peak = equity
-            peak_ts = t["close_ts"]
+            peak_ts = _exit_ts(t)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
             dd_peak_ts = peak_ts
-            dd_trough_ts = t["close_ts"]
+            dd_trough_ts = _exit_ts(t)
 
     max_dd_pct = (max_dd / bankroll * 100) if bankroll > 0 else None
 
     worst_stretch = [
         t for t in ordered
-        if dd_peak_ts <= t["close_ts"] <= dd_trough_ts
+        if dd_peak_ts <= _exit_ts(t) <= dd_trough_ts
     ]
 
     return {
@@ -85,6 +93,33 @@ def drawdown_analysis(trades: list[dict], bankroll: float) -> dict:
         "worst_stretch_end": _iso(dd_trough_ts),
         "worst_stretch_trades": worst_stretch,
     }
+
+
+def validate_bankroll_never_exhausted(trades: list[dict], bankroll: float) -> dict:
+    """Independent post-hoc check (belt-and-suspenders alongside the
+    capital guard baked into simulate_portfolio): replays realized P&L in
+    exit-time order and confirms running equity (bankroll + realized P&L)
+    never went negative. Should always report exhausted=False given the
+    guard in engine.py - if it ever doesn't, that's a bug in the guard,
+    not a strategy-risk finding."""
+    ordered = sorted(trades, key=_exit_ts)
+    equity = bankroll
+    min_equity = bankroll
+    min_equity_ts = None
+    for t in ordered:
+        equity += t["pnl"]
+        if equity < min_equity:
+            min_equity = equity
+            min_equity_ts = _exit_ts(t)
+    return {
+        "exhausted": min_equity < 0,
+        "min_equity_dollars": round(min_equity, 2),
+        "min_equity_ts": _iso(min_equity_ts) if min_equity_ts is not None else None,
+    }
+
+
+def stop_loss_exit_count(trades: list[dict]) -> int:
+    return sum(1 for t in trades if t.get("exit_reason") == "stop_loss")
 
 
 def breakdown_by_category(trades: list[dict]) -> dict:
@@ -114,7 +149,8 @@ def save_trades_csv(trades: list[dict], path: str) -> None:
     fieldnames = [
         "ticker", "category", "entry_ts", "close_ts", "midpoint_yes", "entry_price_no",
         "effective_price_no", "spread", "slippage_cost", "open_interest", "contracts",
-        "cost_before_fee", "fee", "total_cost", "result", "payout", "pnl",
+        "cost_before_fee", "entry_fee", "total_cost", "exit_ts", "exit_reason", "exit_price_no",
+        "exit_fee", "fee", "result", "payout", "proceeds", "pnl",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -123,6 +159,7 @@ def save_trades_csv(trades: list[dict], path: str) -> None:
             row = dict(t)
             row["entry_ts"] = _iso(t["entry_ts"])
             row["close_ts"] = _iso(t["close_ts"])
+            row["exit_ts"] = _iso(_exit_ts(t))
             writer.writerow(row)
 
 

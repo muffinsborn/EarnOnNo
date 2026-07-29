@@ -12,7 +12,7 @@ import sqlite3
 from kalshi_pipeline.timeutil import to_unix_ts
 
 from .fees import taker_fee_dollars
-from .pointintime import price_and_oi_as_of
+from .pointintime import price_and_oi_as_of, price_path
 
 logger = logging.getLogger("backtester")
 
@@ -54,7 +54,7 @@ def discover_candidates(
     max_horizon_s = days_to_expiry * 86400
 
     candidates = []
-    skipped_no_history, skipped_no_candle, skipped_price, skipped_bad_result = 0, 0, 0, 0
+    skipped_no_history, skipped_too_long, skipped_no_candle, skipped_price, skipped_bad_result = 0, 0, 0, 0, 0
 
     for ticker, event_ticker, open_time, close_time, result, category in rows:
         close_ts = to_unix_ts(close_time)
@@ -62,13 +62,20 @@ def discover_candidates(
         if close_ts is None or open_ts is None:
             continue
 
+        # days_to_expiry bounds the market's own total lifetime (open to
+        # close), not the entry offset - entry_ts is close_ts minus a fixed
+        # few-hour category offset, so close_ts - entry_ts is always just
+        # that offset and can never exceed a multi-day horizon regardless
+        # of days_to_expiry's value.
+        if close_ts - open_ts > max_horizon_s:
+            skipped_too_long += 1
+            continue
+
         cat = category or "Uncategorized"
         entry_offset_s = _offset_hours_for_category(entry_offset_hours, cat) * 3600
         entry_ts = close_ts - entry_offset_s
         if entry_ts < open_ts:
             skipped_no_history += 1
-            continue
-        if close_ts - entry_ts > max_horizon_s:
             continue
 
         pit = price_and_oi_as_of(conn, ticker, PERIOD_INTERVAL, entry_ts)
@@ -103,11 +110,56 @@ def discover_candidates(
         })
 
     logger.info(
-        "Discovered %d eligible candidates (skipped: %d too-young, %d no candle data yet, "
+        "Discovered %d eligible candidates (skipped: %d too-long-dated, %d too-young, %d no candle data yet, "
         "%d outside price band, %d unresolved/bad result).",
-        len(candidates), skipped_no_history, skipped_no_candle, skipped_price, skipped_bad_result,
+        len(candidates), skipped_too_long, skipped_no_history, skipped_no_candle, skipped_price, skipped_bad_result,
     )
     return candidates
+
+
+def _resolve_position_exit(
+    conn: sqlite3.Connection,
+    cand: dict,
+    effective_price_no: float,
+    stop_loss_pct: float | None,
+    exit_cache: dict | None,
+):
+    """Determines when/how a position that was just opened actually leaves
+    the portfolio: either stopped out early on a mark-to-market drawdown, or
+    held to its own resolution.
+
+    Reads candles strictly after entry_ts - this is the position's own
+    future, read only to time ITS exit/P&L, exactly like `result` is read
+    only after entry. It never affects which candidates get admitted at
+    their own entry_ts (see simulate_portfolio).
+
+    "Drawdown" is mark-to-market against what the position could be sold
+    for right now - the NO bid, i.e. 1 - yes_ask - compared to what it cost
+    to enter. Cached by ticker since, within one discover_candidates() call,
+    a given ticker's entry price/path is identical across sweep runs that
+    only vary category_cap_pct."""
+    cache_key = cand["ticker"]
+    if exit_cache is not None and cache_key in exit_cache:
+        return exit_cache[cache_key]
+
+    result_exit_ts, result_exit_price, result_reason = cand["close_ts"], None, "resolution"
+    if stop_loss_pct:
+        for end_ts, _yes_bid, yes_ask in price_path(conn, cand["ticker"], PERIOD_INTERVAL, cand["entry_ts"], cand["close_ts"]):
+            if yes_ask is None:
+                continue
+            mark_price_no = 1 - yes_ask
+            drawdown = 1 - (mark_price_no / effective_price_no)
+            if drawdown >= stop_loss_pct:
+                result_exit_ts, result_exit_price, result_reason = end_ts, mark_price_no, "stop_loss"
+                break
+
+    if result_reason == "resolution":
+        result_exit_price = 1.0 if cand["result"] == "no" else 0.0
+
+    outcome = (result_exit_ts, result_exit_price, result_reason)
+    if exit_cache is not None:
+        exit_cache[cache_key] = outcome
+    return outcome
 
 
 def simulate_portfolio(
@@ -117,6 +169,9 @@ def simulate_portfolio(
     category_cap_pct: float,
     max_concurrent: int,
     slippage_pct_of_spread: float = 0.5,
+    conn: sqlite3.Connection | None = None,
+    stop_loss_pct: float | None = 0.25,
+    exit_cache: dict | None = None,
 ) -> list[dict]:
     """Event-driven simulation ordered by entry time (ties broken by open
     interest descending, so contended portfolio slots go to the more liquid
@@ -128,7 +183,25 @@ def simulate_portfolio(
     (fee = 0.07 * contracts * price * (1-price)), slippage doesn't just
     add a flat cost - it also shifts the fee, which is what "slippage will
     bite into fees" means concretely here: fee is computed on the
-    post-slippage price, not the quoted one."""
+    post-slippage price, not the quoted one.
+
+    Capital guard: available capital is tracked as starting bankroll, plus
+    P&L realized from positions that have actually exited by the current
+    entry_ts, minus cost committed to positions still open at that instant.
+    A new position is only opened if its full cost fits within that - this
+    makes bankroll exhaustion structurally impossible rather than merely
+    checked after the fact (each position's worst-case loss is its own
+    committed cost, which was already capital-checked at entry).
+
+    Stop-loss: if stop_loss_pct is set (default 0.25 = 25%), a position
+    whose mark-to-market value ever falls that far below its entry cost is
+    exited then (at that mark price, minus the same taker fee formula
+    applied to the exit trade) instead of held to resolution, freeing its
+    committed capital for redeployment at that point in time. Pass
+    stop_loss_pct=None to disable and hold every position to resolution."""
+    if stop_loss_pct and conn is None:
+        raise ValueError("stop_loss_pct requires conn (needs the position's own future price path)")
+
     position_dollars = bankroll * position_pct
     category_cap_dollars = bankroll * category_cap_pct
 
@@ -136,15 +209,27 @@ def simulate_portfolio(
 
     open_positions: list[dict] = []
     trades = []
+    realized_pnl = 0.0
 
     for cand in ordered:
-        open_positions = [p for p in open_positions if p["close_ts"] > cand["entry_ts"]]
+        still_open = []
+        for p in open_positions:
+            if p["exit_ts"] > cand["entry_ts"]:
+                still_open.append(p)
+            else:
+                realized_pnl += p["pnl"]
+        open_positions = still_open
 
         if len(open_positions) >= max_concurrent:
             continue
 
         category_committed = sum(p["cost"] for p in open_positions if p["category"] == cand["category"])
         if category_committed + position_dollars > category_cap_dollars:
+            continue
+
+        capital_committed = sum(p["cost"] for p in open_positions)
+        available_capital = bankroll + realized_pnl - capital_committed
+        if position_dollars > available_capital:
             continue
 
         quoted_price = cand["entry_price_no"]
@@ -156,11 +241,19 @@ def simulate_portfolio(
             continue
 
         cost_before_fee = contracts * effective_price
-        fee = taker_fee_dollars(contracts, effective_price)
-        total_cost = cost_before_fee + fee
+        entry_fee = taker_fee_dollars(contracts, effective_price)
+        total_cost = cost_before_fee + entry_fee
+        if total_cost > available_capital:
+            continue
 
-        payout = float(contracts) if cand["result"] == "no" else 0.0
-        pnl = payout - total_cost
+        exit_ts, exit_price_no, exit_reason = _resolve_position_exit(
+            conn, cand, effective_price, stop_loss_pct, exit_cache
+        )
+
+        proceeds_before_fee = contracts * exit_price_no
+        exit_fee = taker_fee_dollars(contracts, exit_price_no) if exit_reason == "stop_loss" else 0.0
+        proceeds = proceeds_before_fee - exit_fee
+        pnl = proceeds - total_cost
 
         trade = {
             **cand,
@@ -168,12 +261,20 @@ def simulate_portfolio(
             "effective_price_no": round(effective_price, 4),
             "slippage_cost": round(contracts * (effective_price - quoted_price), 4),
             "cost_before_fee": round(cost_before_fee, 4),
-            "fee": fee,
+            "entry_fee": entry_fee,
+            "fee": entry_fee + exit_fee,  # kept for report.py's existing "total fees" summary
             "total_cost": round(total_cost, 4),
-            "payout": payout,
+            "exit_ts": exit_ts,
+            "exit_reason": exit_reason,
+            "exit_price_no": round(exit_price_no, 4),
+            "exit_fee": exit_fee,
+            "payout": round(proceeds_before_fee, 4),
+            "proceeds": round(proceeds, 4),
             "pnl": round(pnl, 4),
         }
         trades.append(trade)
-        open_positions.append({"close_ts": cand["close_ts"], "category": cand["category"], "cost": total_cost})
+        open_positions.append({
+            "exit_ts": exit_ts, "category": cand["category"], "cost": total_cost, "pnl": pnl,
+        })
 
     return trades

@@ -11,6 +11,13 @@ with end_period_ts <= the simulated entry timestamp. The `result` column
 to compute payout - never for selection or ranking. See backtester/engine.py
 for the exact mechanism.
 
+CAPITAL SAFETY: simulate_portfolio() enforces a hard capital guard (a new
+position is only opened if bankroll + realized P&L so far - capital tied up
+in still-open positions covers its full cost) and a per-position stop-loss
+(default 25% mark-to-market drawdown exits the position early, freeing its
+capital). Together these make bankroll exhaustion structurally impossible;
+validate_bankroll_never_exhausted() re-checks this after the fact.
+
 Usage:
     python backtest.py                    # full run with defaults below
     python backtest.py --price-threshold 0.05 --days-to-expiry 7
@@ -31,7 +38,9 @@ from backtester.report import (
     drawdown_analysis,
     print_summary,
     save_trades_csv,
+    stop_loss_exit_count,
     summarize,
+    validate_bankroll_never_exhausted,
 )
 
 logger = logging.getLogger("backtester")
@@ -65,6 +74,10 @@ def main():
                          help="Fraction of the quoted bid-ask spread added to the taker price as slippage "
                               "(default 0.5 = pay through half the spread). Since Kalshi's fee is itself a "
                               "function of price, this also shifts the fee, not just the raw cost.")
+    parser.add_argument("--stop-loss-pct", type=float, default=0.25,
+                         help="Exit a position early if its mark-to-market value ever falls this fraction "
+                              "below its entry cost (default 0.25 = 25%%), freeing its capital for "
+                              "redeployment. Pass 0 to disable and hold every position to resolution.")
     parser.add_argument("--out-dir", default="backtest_results", help="Directory for the trades CSV")
     args = parser.parse_args()
 
@@ -94,6 +107,8 @@ def main():
         category_cap_pct=args.category_cap_pct,
         max_concurrent=args.max_concurrent,
         slippage_pct_of_spread=args.slippage_pct_of_spread,
+        conn=conn,
+        stop_loss_pct=args.stop_loss_pct or None,
     )
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -109,6 +124,16 @@ def main():
     if dd["worst_stretch_trades"]:
         print(f"  window:        {dd['worst_stretch_start']} -> {dd['worst_stretch_end']}")
         print(f"  trades in window: {len(dd['worst_stretch_trades'])}")
+
+    bankroll_check = validate_bankroll_never_exhausted(trades, bankroll=args.bankroll)
+    print(f"\n=== CAPITAL SAFETY CHECKS ===")
+    status = "VIOLATED - BUG" if bankroll_check["exhausted"] else "OK - never exhausted"
+    print(f"  bankroll exhaustion: {status} (min running equity ${bankroll_check['min_equity_dollars']:,.2f}"
+          f"{' at ' + bankroll_check['min_equity_ts'] if bankroll_check['min_equity_ts'] else ''})")
+    if args.stop_loss_pct:
+        print(f"  stop-loss ({args.stop_loss_pct*100:.0f}%) exits: {stop_loss_exit_count(trades)}/{len(trades)} trades")
+    else:
+        print(f"  stop-loss: disabled (--stop-loss-pct 0)")
 
     print("\n=== BY CATEGORY ===")
     for cat, stats in breakdown_by_category(trades).items():

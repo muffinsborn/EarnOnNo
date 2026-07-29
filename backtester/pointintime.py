@@ -28,3 +28,22 @@ def price_and_oi_as_of(conn: sqlite3.Connection, ticker: str, period_interval: i
     if yes_bid is None or yes_ask is None:
         return None
     return yes_bid, yes_ask, (open_interest or 0)
+
+
+def price_path(conn: sqlite3.Connection, ticker: str, period_interval: int, start_ts: int, end_ts: int):
+    """Returns (end_period_ts, yes_bid_close, yes_ask_close) rows strictly
+    after start_ts up to and including end_ts, in ascending time order.
+
+    This is used to walk a position's OWN price history forward after it has
+    already been opened (e.g. for stop-loss timing), the same way `result` is
+    read only after entry to compute P&L. It must never be used to decide
+    whether to admit a candidate at its own entry_ts."""
+    return conn.execute(
+        """
+        SELECT end_period_ts, yes_bid_close, yes_ask_close
+        FROM market_candles
+        WHERE ticker = ? AND period_interval = ? AND end_period_ts > ? AND end_period_ts <= ?
+        ORDER BY end_period_ts ASC
+        """,
+        (ticker, period_interval, start_ts, end_ts),
+    ).fetchall()
