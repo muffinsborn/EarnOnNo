@@ -172,6 +172,7 @@ def simulate_portfolio(
     conn: sqlite3.Connection | None = None,
     stop_loss_pct: float | None = 0.25,
     exit_cache: dict | None = None,
+    position_dollars_fixed: float | None = None,
 ) -> list[dict]:
     """Event-driven simulation ordered by entry time (ties broken by open
     interest descending, so contended portfolio slots go to the more liquid
@@ -198,11 +199,16 @@ def simulate_portfolio(
     exited then (at that mark price, minus the same taker fee formula
     applied to the exit trade) instead of held to resolution, freeing its
     committed capital for redeployment at that point in time. Pass
-    stop_loss_pct=None to disable and hold every position to resolution."""
+    stop_loss_pct=None to disable and hold every position to resolution.
+
+    position_dollars_fixed, if given, overrides position_pct with a flat
+    dollar amount per position (e.g. $200) that does not scale with
+    bankroll or with category_cap_pct - use this to isolate sizing as a
+    variable independent of both."""
     if stop_loss_pct and conn is None:
         raise ValueError("stop_loss_pct requires conn (needs the position's own future price path)")
 
-    position_dollars = bankroll * position_pct
+    position_dollars = position_dollars_fixed if position_dollars_fixed is not None else bankroll * position_pct
     category_cap_dollars = bankroll * category_cap_pct
 
     ordered = sorted(candidates, key=lambda c: (c["entry_ts"], -c["open_interest"]))

@@ -18,6 +18,7 @@ def summarize(trades: list[dict]) -> dict:
     costs = [t["total_cost"] for t in trades]
     returns = [t["pnl"] / t["total_cost"] for t in trades if t["total_cost"] > 0]
     wins = sum(1 for p in pnls if p > 0)
+    win_rate = wins / len(trades)
 
     sharpe_like = None
     if len(returns) > 1:
@@ -25,16 +26,38 @@ def summarize(trades: list[dict]) -> dict:
         if stdev > 0:
             sharpe_like = statistics.mean(returns) / stdev
 
+    # Edge computed directly rather than inferred separately from win rate
+    # and price. A NO contract bought at price p pays $1/contract on a win,
+    # $0 on a loss, so expected profit = P(win) - p: breakeven is exactly
+    # the (fee-inclusive) average price paid, contract-weighted so heavier
+    # positions count proportionally more - NOT "1 - price", which would
+    # invert the sign (these are longshot-YES markets, so the NO price
+    # paid is close to $1, and breakeven should be close to the ~90% win
+    # rates observed, not close to 0%). win_rate above already reflects any
+    # stop-loss that cut an eventual winner short (pnl > 0, not result ==
+    # "no"), so edge_bps nets that cost in too, not just fees.
+    total_contracts = sum(t["contracts"] for t in trades)
+    avg_entry_price_no = None
+    breakeven_win_rate = None
+    edge_bps = None
+    if total_contracts > 0:
+        avg_entry_price_no = sum(t["effective_price_no"] * t["contracts"] for t in trades) / total_contracts
+        breakeven_win_rate = sum(t["total_cost"] for t in trades) / total_contracts
+        edge_bps = (win_rate - breakeven_win_rate) * 10000
+
     return {
         "total_trades": len(trades),
         "wins": wins,
         "losses": len(trades) - wins,
-        "win_rate": wins / len(trades),
+        "win_rate": win_rate,
         "total_pnl": round(sum(pnls), 2),
         "total_cost_deployed": round(sum(costs), 2),
         "total_fees": round(sum(t["fee"] for t in trades), 2),
         "roi_pct": round(100 * sum(pnls) / sum(costs), 2) if sum(costs) else None,
         "sharpe_like_per_trade": round(sharpe_like, 3) if sharpe_like is not None else None,
+        "avg_entry_price_no": round(avg_entry_price_no, 4) if avg_entry_price_no is not None else None,
+        "breakeven_win_rate": round(breakeven_win_rate, 4) if breakeven_win_rate is not None else None,
+        "edge_bps": round(edge_bps, 1) if edge_bps is not None else None,
     }
 
 
@@ -174,4 +197,6 @@ def print_summary(title: str, stats: dict) -> None:
     print(f"  capital deployed: ${stats['total_cost_deployed']:,.2f}")
     print(f"  ROI:           {stats['roi_pct']}%")
     print(f"  total fees:    ${stats['total_fees']:,.2f}")
+    print(f"  avg NO price:  {stats['avg_entry_price_no']}  |  breakeven win rate: {stats['breakeven_win_rate']}"
+          f"  |  edge: {stats['edge_bps']} bps")
     print(f"  sharpe-like:   {stats['sharpe_like_per_trade']} (per-trade return mean/stdev, not time-annualized)")
