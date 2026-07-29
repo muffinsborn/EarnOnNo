@@ -249,8 +249,3 @@ def set_sync_cursor(conn: sqlite3.Connection, key: str, cursor: str | None) -> N
         (key, cursor),
     )
     conn.commit()
-
-
-def clear_sync_cursor(conn: sqlite3.Connection, key: str) -> None:
-    conn.execute("DELETE FROM sync_state WHERE key = ?", (key,))
-    conn.commit()

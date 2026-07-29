@@ -103,13 +103,33 @@ def backfill_missing_events(client: KalshiClient, conn, markets: list[dict], eve
     logger.info("Backfilled %d/%d missing events.", len(fetched), len(missing))
 
 
-def sync_markets(client: KalshiClient, conn, status: str, label: str, max_markets: int | None) -> None:
+DONE_MARKER = "DONE"
+
+
+def sync_markets(
+    client: KalshiClient, conn, status: str, label: str, max_markets: int | None, force_resync: bool = False
+) -> None:
     """Paginates /markets, checkpointing the cursor after every page so a
     restart resumes instead of re-walking from page 1 (this listing alone
     can be millions of rows - re-walking it on every restart in a session
-    that recycles every few minutes would never finish)."""
+    that recycles every few minutes would never finish).
+
+    Once a pass completes naturally (cursor exhausted), the checkpoint is set
+    to DONE_MARKER rather than cleared, so a later invocation of this script
+    knows the listing is already complete and doesn't re-walk it from page 1
+    for no reason - only an in-progress state should trigger a resume, and
+    only --resync-markets/force_resync should trigger a full do-over."""
     checkpoint_key = f"markets_cursor:{status}"
-    start_cursor = db.get_sync_cursor(conn, checkpoint_key)
+    state = db.get_sync_cursor(conn, checkpoint_key)
+
+    if state == DONE_MARKER and not force_resync and not max_markets:
+        logger.info(
+            "Skipping %s markets sync - already fully listed in a previous run "
+            "(pass --resync-markets to force a full refresh).", label,
+        )
+        return
+
+    start_cursor = state if state and state != DONE_MARKER and not force_resync else None
     if start_cursor:
         logger.info("Resuming %s markets sync from a saved checkpoint...", label)
     logger.info("Fetching %s markets (status=%s)...", label, status)
@@ -129,7 +149,7 @@ def sync_markets(client: KalshiClient, conn, status: str, label: str, max_market
             break
 
     if not hit_cap:
-        db.clear_sync_cursor(conn, checkpoint_key)
+        db.set_sync_cursor(conn, checkpoint_key, DONE_MARKER)
     logger.info("Stored %d %s markets this run.", count, label)
 
 
@@ -228,6 +248,10 @@ def main():
                          help="Cap number of resolved/open markets pulled - use for a quick test run")
     parser.add_argument("--resolved-only", action="store_true", help="Only pull resolved (settled) markets")
     parser.add_argument("--open-only", action="store_true", help="Only pull currently open markets")
+    parser.add_argument("--resync-markets", action="store_true",
+                         help="Force a full re-walk of /markets even if a previous run already completed it "
+                              "(by default, a completed listing is skipped entirely on later runs - open markets "
+                              "change constantly so you'll want this periodically to pick up newly-settled ones)")
     parser.add_argument("--resync-events", action="store_true",
                          help="Force a full re-pull of the bulk /events listing even if we already have events "
                               "stored (by default, once events exist locally we skip this ~5-6 min bulk pull and "
@@ -270,9 +294,11 @@ def main():
         event_to_series = load_event_to_series(conn)
 
     if not args.open_only:
-        sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets)
+        sync_markets(client, conn, status="settled", label="resolved", max_markets=args.max_markets,
+                     force_resync=args.resync_markets)
     if not args.resolved_only:
-        sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
+        sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets,
+                     force_resync=args.resync_markets)
 
     since_ts = now_unix_ts() - args.since_days * 86400 if args.since_days > 0 else None
     all_markets = load_markets_for_candles(conn, since_ts=since_ts)
