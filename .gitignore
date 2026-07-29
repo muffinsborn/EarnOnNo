@@ -4,6 +4,8 @@
 data/*.db
 data/*.db-journal
 data/*.db-wal
+data/*.db-shm
+backtest_results/
 __pycache__/
 *.pyc
 .venv/
