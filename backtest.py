@@ -34,6 +34,7 @@ import sqlite3
 from backtester.engine import discover_candidates, simulate_portfolio
 from backtester.report import (
     breakdown_by_price_bucket,
+    breakdown_by_price_cent,
     drawdown_analysis,
     edge_confidence,
     print_summary,
@@ -169,6 +170,17 @@ def main():
     print("\n=== BY PRICE BUCKET (YES price at entry) ===")
     for bucket, stats in breakdown_by_price_bucket(trades).items():
         print_summary(bucket, stats)
+
+    print("\n=== BY PRICE - 1 CENT RESOLUTION (YES price at entry) ===")
+    print(f"  {'bucket':<6}{'trades':>8}{'win%':>8}{'breakeven%':>12}{'edge_bps':>10}{'CI (win rate)':>20}  verdict")
+    for bucket, stats in breakdown_by_price_cent(trades).items():
+        if stats.get("total_trades", 0) == 0:
+            continue
+        ci = f"[{stats['win_rate_ci_low']*100:.1f}, {stats['win_rate_ci_high']*100:.1f}]" \
+            if stats.get("win_rate_ci_low") is not None else "n/a"
+        verdict = "significant" if stats.get("edge_significant") else "noise-consistent"
+        print(f"  {bucket:<6}{stats['total_trades']:>8}{stats['win_rate']*100:>7.1f}%"
+              f"{stats['breakeven_win_rate']*100:>11.1f}%{stats['edge_bps']:>10.1f}{ci:>20}  {verdict}")
 
     print(f"\nFull trade log written to {csv_path}")
 

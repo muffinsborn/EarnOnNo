@@ -205,6 +205,22 @@ def breakdown_by_price_bucket(trades: list[dict]) -> dict:
     return {label: summarize(ts) for label, ts in buckets.items()}
 
 
+def breakdown_by_price_cent(trades: list[dict], low_cents: int = 2, high_cents: int = 15) -> dict:
+    """Same idea as breakdown_by_price_bucket() but at 1-cent resolution,
+    using edge_confidence() (win-rate CI included) per bucket instead of
+    plain summarize() - built for pinpointing exactly where an edge turns
+    from credible to noise-consistent or negative, rather than only seeing
+    it averaged out across a wide band. Buckets are [c, c+1) cents for
+    c in [low_cents, high_cents], keyed as e.g. "7c"; round() before floor
+    guards against float noise (0.15 stored as ~0.14999999999999999)."""
+    buckets: dict[int, list[dict]] = {}
+    for t in trades:
+        cents = int(math.floor(round(t["midpoint_yes"] * 100, 6)))
+        if low_cents <= cents <= high_cents:
+            buckets.setdefault(cents, []).append(t)
+    return {f"{cents}c": edge_confidence(ts) for cents, ts in sorted(buckets.items())}
+
+
 def save_trades_csv(trades: list[dict], path: str) -> None:
     if not trades:
         with open(path, "w") as f:
