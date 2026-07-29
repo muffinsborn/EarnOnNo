@@ -133,7 +133,7 @@ def sync_markets(client: KalshiClient, conn, status: str, label: str, max_market
     logger.info("Stored %d %s markets this run.", count, label)
 
 
-def load_markets_for_candles(conn) -> list[dict]:
+def load_markets_for_candles(conn, since_ts: int | None = None) -> list[dict]:
     """Pulls the market set straight from the DB (cumulative across every run
     to date) rather than relying on any single run's in-memory list, since a
     resumed sync_markets run only yields the pages it fetched THIS time -
@@ -145,11 +145,20 @@ def load_markets_for_candles(conn) -> list[dict]:
     untraded market has no meaningful YES price series to backtest against,
     and pulling hourly candles for every one of them isn't tractable (would
     take weeks of API calls for no analytical value). Metadata/resolution is
-    still kept for every market regardless."""
+    still kept for every market regardless.
+
+    since_ts, if set, further limits candle-fetching to markets that closed
+    on/after that unix timestamp, or are still active (open markets always
+    qualify - they're current by definition). Metadata for older markets is
+    untouched; this only scopes which markets get the (much more expensive)
+    price time series pulled."""
     cols = ["ticker", "event_ticker", "status", "open_time", "close_time"]
-    rows = conn.execute(
-        f"select {', '.join(cols)} from markets where volume is not null and volume > 0"
-    ).fetchall()
+    query = f"select {', '.join(cols)} from markets where volume is not null and volume > 0"
+    params: list = []
+    if since_ts is not None:
+        query += " and (status = 'active' or CAST(strftime('%s', close_time) AS INTEGER) >= ?)"
+        params.append(since_ts)
+    rows = conn.execute(query, params).fetchall()
     return [dict(zip(cols, row)) for row in rows]
 
 
@@ -223,6 +232,12 @@ def main():
                          help="Force a full re-pull of the bulk /events listing even if we already have events "
                               "stored (by default, once events exist locally we skip this ~5-6 min bulk pull and "
                               "rely on per-market backfill for anything missing - much more resilient to restarts)")
+    parser.add_argument("--since-days", type=int, default=30,
+                         help="Only fetch candles for markets that closed within this many days, plus any "
+                              "currently active market (default 30). Metadata/resolution is still pulled for "
+                              "every market regardless - this only scopes the price time series. Kalshi's settled "
+                              "market history via this listing only spans ~90 days back in practice, so anything "
+                              "90+ is equivalent to unlimited. Use 0 for no limit.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -259,7 +274,9 @@ def main():
     if not args.resolved_only:
         sync_markets(client, conn, status="open", label="open", max_markets=args.max_markets)
 
-    all_markets = load_markets_for_candles(conn)
+    since_ts = now_unix_ts() - args.since_days * 86400 if args.since_days > 0 else None
+    all_markets = load_markets_for_candles(conn, since_ts=since_ts)
+    logger.info("%d markets qualify for candles (since_days=%s).", len(all_markets), args.since_days or "unlimited")
     backfill_missing_events(client, conn, all_markets, event_to_series)
 
     if not args.skip_candles:
