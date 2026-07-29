@@ -134,12 +134,22 @@ def sync_markets(client: KalshiClient, conn, status: str, label: str, max_market
 
 
 def load_markets_for_candles(conn) -> list[dict]:
-    """Pulls the full market set straight from the DB (cumulative across every
-    run to date) rather than relying on any single run's in-memory list,
-    since a resumed sync_markets run only yields the pages it fetched THIS
-    time - markets stored by earlier, interrupted runs still need candles."""
+    """Pulls the market set straight from the DB (cumulative across every run
+    to date) rather than relying on any single run's in-memory list, since a
+    resumed sync_markets run only yields the pages it fetched THIS time -
+    markets stored by earlier, interrupted runs still need candles.
+
+    Excludes zero-volume markets: the resolved-market listing turned out to
+    be dominated by millions of auto-generated, near-instant sub-markets
+    (e.g. 15-minute crypto strike ladders) with no trades at all - an
+    untraded market has no meaningful YES price series to backtest against,
+    and pulling hourly candles for every one of them isn't tractable (would
+    take weeks of API calls for no analytical value). Metadata/resolution is
+    still kept for every market regardless."""
     cols = ["ticker", "event_ticker", "status", "open_time", "close_time"]
-    rows = conn.execute(f"select {', '.join(cols)} from markets").fetchall()
+    rows = conn.execute(
+        f"select {', '.join(cols)} from markets where volume is not null and volume > 0"
+    ).fetchall()
     return [dict(zip(cols, row)) for row in rows]
 
 

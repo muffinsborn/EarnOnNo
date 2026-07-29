@@ -189,9 +189,9 @@ def upsert_markets(conn: sqlite3.Connection, rows: list[dict], fetched_at: str) 
                 "open_time": r.get("open_time"),
                 "close_time": r.get("close_time"),
                 "settlement_ts": r.get("settlement_ts") or r.get("settled_time"),
-                "volume": r.get("volume"),
-                "open_interest": r.get("open_interest"),
-                "last_price_dollars": r.get("last_price_dollars"),
+                "volume": int(float(r["volume_fp"])) if r.get("volume_fp") is not None else None,
+                "open_interest": int(float(r["open_interest_fp"])) if r.get("open_interest_fp") is not None else None,
+                "last_price_dollars": float(r["last_price_dollars"]) if r.get("last_price_dollars") is not None else None,
                 "fetched_at": fetched_at,
             }
             for r in rows
