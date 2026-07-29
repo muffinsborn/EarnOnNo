@@ -14,9 +14,10 @@ from .config import Config
 
 logger = logging.getLogger("kalshi_pipeline.client")
 
-# Kalshi caps candlestick responses around 10k rows; stay comfortably under that
-# per request by windowing the start_ts/end_ts range we ask for.
-MAX_CANDLES_PER_REQUEST = 9000
+# Kalshi caps a candlesticks response (single or batch) around 10k rows total;
+# stay comfortably under that. Batch callers should keep
+# len(tickers) * hours_in_window under this.
+MAX_CANDLES_PER_RESPONSE = 9000
 
 
 class KalshiAPIError(RuntimeError):
@@ -128,25 +129,24 @@ class KalshiClient:
             for market in markets:
                 yield market
 
-    def iter_candlesticks(
-        self, series_ticker: str, ticker: str, start_ts: int, end_ts: int, period_interval: int
-    ):
-        """Yields candlestick dicts across [start_ts, end_ts], chunking the range
-        so no single request risks exceeding Kalshi's response size cap."""
-        window_seconds = MAX_CANDLES_PER_REQUEST * period_interval * 60
-        window_start = start_ts
-        while window_start <= end_ts:
-            window_end = min(window_start + window_seconds, end_ts)
-            path = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
-            data = self._get(
-                path,
-                params={
-                    "start_ts": window_start,
-                    "end_ts": window_end,
-                    "period_interval": period_interval,
-                },
-            )
-            candles = data.get("candlesticks", [])
-            for candle in candles:
-                yield candle
-            window_start = window_end + 1
+    def get_market_candlesticks_batch(
+        self, market_tickers: list[str], start_ts: int, end_ts: int, period_interval: int
+    ) -> dict[str, list[dict]]:
+        """GET /markets/candlesticks - up to 100 tickers per request, no
+        series_ticker needed (unlike the single-market endpoint). One call
+        here replaces up to 100 individual per-market requests, which is the
+        difference between ~400k requests and ~4k for a full historical
+        pull. Caller is responsible for keeping len(market_tickers)*hours-in-
+        window under Kalshi's ~10k-candlestick-per-response cap."""
+        if not market_tickers:
+            return {}
+        data = self._get(
+            "/markets/candlesticks",
+            params={
+                "market_tickers": ",".join(market_tickers),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period_interval,
+            },
+        )
+        return {m["market_ticker"]: m.get("candlesticks", []) for m in data.get("markets", [])}

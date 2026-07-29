@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timezone
 
 from kalshi_pipeline import db
-from kalshi_pipeline.client import KalshiAPIError, KalshiClient
+from kalshi_pipeline.client import MAX_CANDLES_PER_RESPONSE, KalshiAPIError, KalshiClient
 from kalshi_pipeline.config import ConfigError, load_config
 from kalshi_pipeline.timeutil import now_unix_ts, to_unix_ts
 
@@ -182,60 +182,106 @@ def load_markets_for_candles(conn, since_ts: int | None = None) -> list[dict]:
     return [dict(zip(cols, row)) for row in rows]
 
 
-def sync_candles(
-    client: KalshiClient,
-    conn,
-    markets: list[dict],
-    event_to_series: dict,
-    period_interval: int,
-) -> None:
+MAX_TICKERS_PER_BATCH = 100
+
+
+def _build_candle_batches(pending: list[dict], period_interval: int) -> list[tuple]:
+    """Greedily groups markets into batches for GET /markets/candlesticks,
+    keeping each batch's (ticker_count * window_periods) under Kalshi's
+    ~10k-candlesticks-per-response cap. Markets are pre-sorted by (start_ts,
+    end_ts) so batches naturally cluster markets with similar/overlapping
+    lifetimes - the common case here, since most markets in this dataset are
+    short-lived and close in waves (many sports matches ending together).
+
+    This is a conservative sizing estimate: it assumes every ticker in a
+    batch could return a candle for every period in the batch's *shared*
+    window, even though in practice each market's own history is shorter
+    than that. Safe to overestimate - worst case is smaller batches than
+    strictly necessary, never an over-cap request."""
+    batches = []
+    current: list[dict] = []
+    batch_start = batch_end = None
+
+    for m in pending:
+        cand_start = m["start_ts"] if batch_start is None else min(batch_start, m["start_ts"])
+        cand_end = m["end_ts"] if batch_end is None else max(batch_end, m["end_ts"])
+        cand_size = len(current) + 1
+        cand_periods = (cand_end - cand_start) / (period_interval * 60) + 1
+
+        if current and (cand_size > MAX_TICKERS_PER_BATCH or cand_size * cand_periods > MAX_CANDLES_PER_RESPONSE):
+            batches.append((current, batch_start, batch_end))
+            current, batch_start, batch_end = [m], m["start_ts"], m["end_ts"]
+        else:
+            current.append(m)
+            batch_start, batch_end = cand_start, cand_end
+
+    if current:
+        batches.append((current, batch_start, batch_end))
+    return batches
+
+
+def sync_candles(client: KalshiClient, conn, markets: list[dict], period_interval: int) -> None:
+    """Fetches candles via the batch endpoint (up to 100 tickers/request)
+    instead of one request per market - the difference between ~400k
+    requests and ~4k for a full historical pull, since raw network latency
+    through this environment's proxy chain (not Kalshi's rate limit) is the
+    actual bottleneck: single requests measured at 0.4-2.4s round-trip."""
     total = len(markets)
-    logger.info("Fetching %d-minute candlesticks for %d markets...", period_interval, total)
     now_ts = now_unix_ts()
 
     # A finalized market's price history never changes, so if we already have
-    # candles for it (e.g. from a run interrupted partway through), skip it -
-    # this is what makes restarts cheap instead of re-pulling everything.
+    # candles for it, skip it - this is what makes restarts cheap.
     already_done = {
         row[0] for row in conn.execute(
             "select distinct ticker from market_candles where period_interval = ?", (period_interval,)
         ).fetchall()
     }
-    skipped = 0
 
-    for i, market in enumerate(markets, start=1):
+    pending = []
+    for market in markets:
         ticker = market["ticker"]
         if ticker in already_done and market.get("status") == "finalized":
-            skipped += 1
             continue
-        series_ticker = event_to_series.get(market.get("event_ticker"))
-        if not series_ticker:
-            logger.warning("Skipping candles for %s: no series_ticker found via event_ticker=%s",
-                            ticker, market.get("event_ticker"))
-            continue
-
         start_ts = to_unix_ts(market.get("open_time"))
-        end_ts = to_unix_ts(market.get("close_time")) or now_ts
-        if start_ts is None:
-            logger.warning("Skipping candles for %s: no open_time", ticker)
+        end_ts = min(to_unix_ts(market.get("close_time")) or now_ts, now_ts)
+        if start_ts is None or end_ts <= start_ts:
             continue
-        end_ts = min(end_ts, now_ts)
-        if end_ts <= start_ts:
-            continue
+        pending.append({"ticker": ticker, "start_ts": start_ts, "end_ts": end_ts})
 
+    skipped = total - len(pending)
+    pending.sort(key=lambda m: (m["start_ts"], m["end_ts"]))
+    batches = _build_candle_batches(pending, period_interval)
+
+    logger.info(
+        "Fetching %d-minute candlesticks for %d markets via %d batches (%d already done, skipped).",
+        period_interval, len(pending), len(batches), skipped,
+    )
+
+    markets_done = 0
+    for batch_i, (batch_markets, batch_start, batch_end) in enumerate(batches, start=1):
+        tickers = [m["ticker"] for m in batch_markets]
         try:
-            candles = list(client.iter_candlesticks(series_ticker, ticker, start_ts, end_ts, period_interval))
+            result = client.get_market_candlesticks_batch(tickers, batch_start, batch_end, period_interval)
         except KalshiAPIError as exc:
-            logger.error("Failed to fetch candles for %s: %s", ticker, exc)
+            logger.error("Failed to fetch candle batch (%d tickers): %s", len(tickers), exc)
             continue
 
-        if candles:
-            db.upsert_candles(conn, ticker, period_interval, candles)
+        for ticker, candles in result.items():
+            if candles:
+                db.upsert_candles(conn, ticker, period_interval, candles)
 
-        if i % 100 == 0 or i == total:
-            logger.info("...candles pulled for %d/%d markets (%d already done, skipped)", i, total, skipped)
+        missing = set(tickers) - set(result.keys())
+        if missing:
+            logger.warning("%d tickers missing from batch response (e.g. %s)", len(missing), sorted(missing)[:3])
 
-    logger.info("Candles done: %d fetched, %d already had data and were skipped.", total - skipped, skipped)
+        markets_done += len(batch_markets)
+        if batch_i % 10 == 0 or batch_i == len(batches):
+            logger.info("...processed %d/%d batches (%d/%d markets)", batch_i, len(batches), markets_done, len(pending))
+
+    logger.info(
+        "Candles done: %d markets fetched via %d batches, %d already had data and were skipped.",
+        markets_done, len(batches), skipped,
+    )
 
 
 def main():
@@ -306,7 +352,7 @@ def main():
     backfill_missing_events(client, conn, all_markets, event_to_series)
 
     if not args.skip_candles:
-        sync_candles(client, conn, all_markets, event_to_series, args.candle_interval)
+        sync_candles(client, conn, all_markets, args.candle_interval)
     else:
         logger.info("Skipping candlestick pull (--skip-candles).")
 
