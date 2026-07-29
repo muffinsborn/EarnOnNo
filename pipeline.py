@@ -237,7 +237,16 @@ def sync_candles(client: KalshiClient, conn, markets: list[dict], period_interva
         ).fetchall()
     }
 
+    # A single long-lived market (open_time far in the past, close_time
+    # recent - e.g. a yearly election market that just resolved) can by
+    # itself span more periods than the ~10k-candlesticks-per-response cap
+    # allows, even alone in its own batch. Pre-split any such market's
+    # window into cap-sized chunks so no pending item, on its own, can ever
+    # violate the cap that _build_candle_batches enforces across a batch.
+    max_span_seconds = MAX_CANDLES_PER_RESPONSE * period_interval * 60
+
     pending = []
+    chunked_market_count = 0
     for market in markets:
         ticker = market["ticker"]
         if ticker in already_done and market.get("status") == "finalized":
@@ -246,9 +255,22 @@ def sync_candles(client: KalshiClient, conn, markets: list[dict], period_interva
         end_ts = min(to_unix_ts(market.get("close_time")) or now_ts, now_ts)
         if start_ts is None or end_ts <= start_ts:
             continue
-        pending.append({"ticker": ticker, "start_ts": start_ts, "end_ts": end_ts})
 
-    skipped = total - len(pending)
+        if end_ts - start_ts > max_span_seconds:
+            chunked_market_count += 1
+            chunk_start = start_ts
+            while chunk_start < end_ts:
+                chunk_end = min(chunk_start + max_span_seconds, end_ts)
+                pending.append({"ticker": ticker, "start_ts": chunk_start, "end_ts": chunk_end})
+                chunk_start = chunk_end
+        else:
+            pending.append({"ticker": ticker, "start_ts": start_ts, "end_ts": end_ts})
+
+    if chunked_market_count:
+        logger.info("%d long-lived markets pre-split into multiple time chunks to stay under the candlestick cap.",
+                     chunked_market_count)
+
+    skipped = total - len({p["ticker"] for p in pending})
     pending.sort(key=lambda m: (m["start_ts"], m["end_ts"]))
     batches = _build_candle_batches(pending, period_interval)
 
